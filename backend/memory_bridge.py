@@ -14,7 +14,58 @@ from pydantic import BaseModel, Field, ConfigDict
 from dotenv import load_dotenv
 
 import cognee
-from litellm import acompletion, aembedding
+from litellm import acompletion as _litellm_acompletion, aembedding as _litellm_aembedding
+
+# ── Resilient LLM calls ─────────────────────────────────────────────────────
+# Gemini regularly answers 503 "high demand" / 429 "rate limit" for a few seconds
+# at a time. Every LLM / embedding call in this service goes through these wrappers,
+# which retry with backoff and then (optionally) try LLM_FALLBACK_MODEL.
+_LLM_RETRY_DELAYS = [0, 2, 5]   # per model; then the fallback model gets the same tries
+_TRANSIENT_MARKERS = ("503", "429", "500", "unavailable", "high demand", "overloaded",
+                      "rate limit", "resource_exhausted", "timeout", "timed out", "deadline")
+
+
+def _is_transient(err: Exception) -> bool:
+    msg = str(err).lower()
+    return any(m in msg for m in _TRANSIENT_MARKERS)
+
+
+_DEFAULT_GEMINI_FALLBACK = "gemini/gemini-flash-lite-latest"
+
+
+async def _with_retries(call, kwargs: dict, label: str, fallback_env: str = None):
+    primary = kwargs.get("model")
+    models = [primary]
+    if fallback_env:
+        fallback = os.getenv(fallback_env)
+        if not fallback and str(primary or "").startswith("gemini/"):
+            fallback = _DEFAULT_GEMINI_FALLBACK
+        if fallback and fallback not in models:
+            models.append(fallback)
+    last_error = None
+    for model_name in models:
+        for attempt, delay in enumerate(_LLM_RETRY_DELAYS):
+            if delay:
+                print(f"[LLM] {label} on {model_name} busy, retrying in {delay}s (attempt {attempt + 1}/{len(_LLM_RETRY_DELAYS)})")
+                await asyncio.sleep(delay)
+            try:
+                return await call(**{**kwargs, "model": model_name})
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                last_error = e
+                print(f"[LLM] {label} failed on {model_name}: {str(e)[:160]}")
+                if not _is_transient(e):
+                    raise
+    raise last_error
+
+
+async def acompletion(**kwargs):
+    return await _with_retries(_litellm_acompletion, kwargs, "completion", "LLM_FALLBACK_MODEL")
+
+
+async def aembedding(**kwargs):
+    return await _with_retries(_litellm_aembedding, kwargs, "embedding")
 from supabase import create_client, Client
 
 def cosine_similarity(v1, v2):
@@ -583,7 +634,9 @@ async def _generate_blindspots_logic(profile: str, full_history: str = "", token
                     if topic:
                         for t in str(topic).split(','):
                             clean_t = t.strip(' .!?,').lower()
-                            if clean_t:
+                            # Very short topics ("a", "the", "me") would substring-match
+                            # nearly every entry and silently wipe the whole history.
+                            if len(clean_t) >= 4:
                                 forbidden_entities.add(clean_t)
         except Exception as e:
             print(f"Failed to load manifest history: {e}")
@@ -604,7 +657,8 @@ async def _generate_blindspots_logic(profile: str, full_history: str = "", token
                     .execute()
                     
             timeline_res = await asyncio.to_thread(fetch_timeline)
-            
+            fetched_count = len(timeline_res.data or [])
+
             if timeline_res.data:
                 for item in reversed(timeline_res.data):
                     date_str = item["created_at"].split("T")[0]
@@ -617,6 +671,8 @@ async def _generate_blindspots_logic(profile: str, full_history: str = "", token
                             continue
                         seen_lines.add(item_str)
                         raw_context_lines.append(item_str)
+            print(f"[Blindspots] profile={profile} fetched={fetched_count} kept={len(raw_context_lines)} "
+                  f"forgotten_topics={len(forbidden_entities)} token={'yes' if token else 'no'}")
         except Exception as e:
             print(f"Native Supabase timeline fetch failed in blindspots: {e}")
             
@@ -705,26 +761,42 @@ async def _generate_blindspots_logic(profile: str, full_history: str = "", token
     if graph_context_str:
         user_prompt += f"\n\nDeep Semantic Graph Insights (Across entire history):\n{graph_context_str}"
     
-    llm_response = await acompletion(
-        model=os.getenv("LLM_MODEL", "gemini/gemini-3.1-flash-lite"),
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ],
-        temperature=0.2
-    )
-    
-    analysis_result = llm_response.choices[0].message.content.strip()
-    
+    # acompletion() retries Gemini's transient 503/429 errors (see top of file).
+    try:
+        llm_response = await acompletion(
+            model=os.getenv("LLM_MODEL", "gemini/gemini-3.1-flash-lite"),
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.2
+        )
+    except Exception as e:
+        raise RuntimeError(f"The AI model is unavailable right now, please try again in a minute. ({str(e)[:150]})")
+
+    analysis_result = (llm_response.choices[0].message.content or "").strip()
+    print(f"[Blindspots] LLM replied with {len(analysis_result)} chars")
+
     if analysis_result.startswith("```json"):
         analysis_result = analysis_result[7:-3].strip()
     elif analysis_result.startswith("```"):
         analysis_result = analysis_result[3:-3].strip()
-        
+
+    # Models sometimes add a sentence before/after the array — keep just the JSON array.
+    if not analysis_result.startswith("["):
+        start, end = analysis_result.find("["), analysis_result.rfind("]")
+        if start != -1 and end > start:
+            analysis_result = analysis_result[start:end + 1]
+
     try:
         response_json = json.loads(analysis_result)
+        if isinstance(response_json, dict):
+            # e.g. {"blindspots": [...]} — unwrap the first list value
+            response_json = next((v for v in response_json.values() if isinstance(v, list)), [])
         if not isinstance(response_json, list):
             response_json = []
+        response_json = [b for b in response_json if isinstance(b, dict) and b.get("title")]
+        print(f"[Blindspots] parsed {len(response_json)} patterns")
             
         # ARCHITECTURAL MANDATE 6: Deterministic Date Reconciliation (Blindspots)
         for blindspot in response_json:
@@ -746,7 +818,7 @@ async def _generate_blindspots_logic(profile: str, full_history: str = "", token
                             
         return response_json
     except json.JSONDecodeError:
-        print(f"LLM failed to output a valid JSON array for blindspots: {analysis_result}")
+        print(f"LLM failed to output a valid JSON array for blindspots: {analysis_result[:2000]}")
         return []
 
 async def _background_generate_blindspots(profile: str, full_history: str = ""):

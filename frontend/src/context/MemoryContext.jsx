@@ -53,6 +53,7 @@ export function MemoryProvider({ children }) {
   // --- Blindspots State ---
   const [blindspotsData, setBlindspotsData] = useState(null);
   const [isBlindspotsLoading, setIsBlindspotsLoading] = useState(false);
+  const [blindspotsError, setBlindspotsError] = useState(null);
 
   // --- Feedback Modal State ---
   const [feedbackModalConfig, setFeedbackModalConfig] = useState({
@@ -115,9 +116,10 @@ export function MemoryProvider({ children }) {
   }, [user, loadTimeline]);
 
   // Network Dispatch: Submit
-  const submitMemory = useCallback(async (text, isVoice = false, isSnippet = false, forceSave = false, onComplete = null) => {
+  const submitMemory = useCallback(async (text, isVoice = false, isSnippet = false, forceSave = false, onComplete = null, entryTimestamp = null) => {
     try {
-      const timestamp = new Date().toISOString();
+      // entryTimestamp lets the voice companion file an entry under an earlier day ("this was yesterday").
+      const timestamp = entryTimestamp || new Date().toISOString();
       const result = await ingestEntry({ text, isSnippet, timestamp, force_save: forceSave });
       
       // Intercept tripwire alert
@@ -262,16 +264,23 @@ export function MemoryProvider({ children }) {
       }
       
       console.error('Oracle failed:', err);
-      const is404 = err.message && err.message.includes('404');
-      
+      const errMsg = (err && err.message) || '';
+      const is404 = errMsg.includes('404');
+      const isOffline = /failed to fetch|networkerror|load failed/i.test(errMsg);
+      const isBusy = /503|429|high demand|unavailable|overloaded|rate limit|busy/i.test(errMsg);
+
       setOracleCardsStream(prev => prev.map(card => {
         if (card.id === pendingId) {
           return {
             ...card,
-            answer: { 
-              text: is404 
-                ? "I don't have enough memories in the graph yet. Keep journaling in The Slate, and I will build your cognitive map." 
-                : "I couldn't reach my memory banks right now. The backend may be offline.",
+            answer: {
+              text: is404
+                ? "I don't have enough memories in the graph yet. Keep journaling in The Slate, and I will build your cognitive map."
+                : isOffline
+                  ? "I couldn't reach my memory banks right now. The backend may be offline."
+                  : isBusy
+                    ? "The AI service is very busy right now. Your memories are safe — please ask me again in a minute."
+                    : `Something went wrong while searching your memories. ${errMsg ? `(${errMsg.slice(0, 160)})` : ''}`,
               isError: true 
             },
             type: 'text'
@@ -470,13 +479,17 @@ export function MemoryProvider({ children }) {
   const refreshBlindspots = useCallback(async (force = false) => {
     if (isBlindspotsLoading) return;
     setIsBlindspotsLoading(true);
+    setBlindspotsError(null);
     try {
       const response = await fetchBlindspots({ force_refresh: force });
       if (response && response.status === 'success') {
         setBlindspotsData(response);
+      } else {
+        setBlindspotsError(response?.message || 'Pattern analysis returned an unexpected response.');
       }
     } catch (err) {
       console.error('Failed to load blindspots:', err);
+      setBlindspotsError(`Pattern analysis failed: ${err.message || err}`);
     } finally {
       setIsBlindspotsLoading(false);
     }
@@ -508,6 +521,7 @@ export function MemoryProvider({ children }) {
     setOracleInputValue,
     cancelOracleQuery,
     blindspotsData,
+    blindspotsError,
     isBlindspotsLoading,
     refreshBlindspots,
   };

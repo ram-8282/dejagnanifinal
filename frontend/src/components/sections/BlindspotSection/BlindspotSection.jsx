@@ -9,20 +9,21 @@ import './BlindspotSection.css';
  * Handles 404 Empty State gracefully.
  */
 export default function BlindspotSection() {
-  const { blindspotsData, isBlindspotsLoading: loading, refreshBlindspots } = useMemory();
+  const { blindspotsData, blindspotsError, isBlindspotsLoading: loading, refreshBlindspots } = useMemory();
   const [safeguardTopic, setSafeguardTopic] = useState(null);
   const [localInsights, setLocalInsights] = useState(null); // to allow manual filtering of dissolved items
 
   useEffect(() => {
-    if (!blindspotsData && !loading) {
+    // Don't auto-retry after an error, or a failing backend gets hammered in a loop.
+    if (!blindspotsData && !loading && !blindspotsError) {
       refreshBlindspots();
     }
-  }, [blindspotsData, loading, refreshBlindspots]);
+  }, [blindspotsData, blindspotsError, loading, refreshBlindspots]);
 
   let insights = [];
   let emptyState = false;
   let lastFetched = null;
-  let error = null;
+  let error = blindspotsError;
 
   if (blindspotsData) {
     if (blindspotsData.status === 'success' && Array.isArray(blindspotsData.data)) {

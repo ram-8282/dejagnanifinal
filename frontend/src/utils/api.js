@@ -5,6 +5,7 @@
  */
 
 import { supabase } from '../lib/supabase';
+import { getVoicePreference } from './voicePreference';
 
 const BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:5051';
 
@@ -111,8 +112,16 @@ export async function fetchVoiceStatus() {
 export async function transcribeVoiceAudio(audioBlob, language = 'indic-auto', model = 'prisma-v3.0') {
   const { profile, token } = await getProfileAndToken();
   const formData = new FormData();
-  formData.append('audio', audioBlob, 'recording.webm');
+  
+  // Ensure audio blob is sent as audio/wav with recording.wav filename
+  const wavBlob = audioBlob.type === 'audio/wav' 
+    ? audioBlob 
+    : new Blob([audioBlob], { type: 'audio/wav' });
+
+  const filename = 'recording.wav';
+  formData.append('audio', wavBlob, filename);
   formData.append('language', language);
+  formData.append('language_code', language);
   formData.append('model', model);
 
   const h = {
@@ -122,11 +131,15 @@ export async function transcribeVoiceAudio(audioBlob, language = 'indic-auto', m
     h['x-user-token'] = token;
   }
 
+  console.log(`[API /api/voice/stt] Sending POST request. Filename: ${filename}, Size: ${audioBlob.size} B, Type: ${audioBlob.type}, Lang: ${language}, Model: ${model}`);
+
   const res = await fetch(`${BASE_URL}/api/voice/stt`, {
     method: 'POST',
     headers: h,
     body: formData,
   });
+
+  console.log(`[API /api/voice/stt] Received response status: ${res.status} ${res.statusText}`);
 
   if (!res.ok) {
     let errPayload = { message: res.statusText };
@@ -135,15 +148,22 @@ export async function transcribeVoiceAudio(audioBlob, language = 'indic-auto', m
     } catch (e) {
       // Non-JSON response
     }
-    console.error('Gnani STT Frontend Rejection:', errPayload);
-    throw new Error(errPayload.message || errPayload.error || `HTTP ${res.status}`);
+    console.error('[API /api/voice/stt] Request failed with HTTP', res.status, errPayload);
+    const errMsg = errPayload.error?.message || errPayload.message || (typeof errPayload.error === 'string' ? errPayload.error : JSON.stringify(errPayload.error)) || `HTTP ${res.status}`;
+    throw new Error(errMsg);
   }
 
-  return res.json();
+  const json = await res.json();
+  console.log('[API /api/voice/stt] Response JSON payload:', json);
+  return json;
 }
 
 /** Synthesize speech from text via Gnani Timbre REST API */
 export async function synthesizeVoiceSpeech({ text, language, voice, speed }) {
+  // Fall back to the voice/speed the person picked in the Voice picker.
+  const pref = getVoicePreference();
+  voice = voice || pref.voice || undefined;
+  speed = typeof speed === 'number' ? speed : pref.speed;
   const { profile, token } = await getProfileAndToken();
   const h = {
     'Content-Type': 'application/json',

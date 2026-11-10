@@ -6,6 +6,8 @@
 [![React Vite](https://img.shields.io/badge/React-Vite-61DAFB?style=flat&logo=react)](https://vite.dev/)
 [![Cognee](https://img.shields.io/badge/Cognee-Cloud%20%26%20OS-purple)](https://www.cognee.ai/)
 
+> 📄 **[Read the one-page Solution Pitch →](PITCH.md)**
+
 **Déjà** is a next-generation personal memory reconstruction and recovery engine. It acts as a cognitive sanctuary, allowing users to journal their daily lives, review chronological timelines, query their history through a highly accurate semantic retriever (**Oracle**), discover hidden patterns or forgotten details (**Blindspots**), and bookmark important milestones.
 
 At its core, Déjà integrates **Cognee** (both the Open Source Python library and Cognee Cloud services) to construct, traverse, and query a semantic graph network of user experiences, creating an intelligent memory layer.
@@ -60,6 +62,12 @@ Automated detection of contradictions, forgotten connections, and chronological 
 ### 🔒 4. Memory Safeguard (Sanctuary & Wipes)
 Control what your AI memory retention system keeps or forgets.
 * **Cognee Pipeline**: Provides target purging using `cognee.forget()` to erase specific memory branches, and a complete system wipe using `cognee.prune` to reset the vector graph cleanly.
+
+### 🎙️ 5. Gnani.ai Indic Voice AI
+Native Indic speech recognition and vocal synthesis powering both The Slate and The Oracle.
+* **Prisma STT Engine (v3.0)**: High-accuracy Speech-to-Text supporting Auto-detect, Indian English, Hindi, Telugu, Tamil, and Kannada.
+* **Timbre TTS Engine (v2.5)**: Natural Indic voice feedback reading Oracle cognitive insights and memory reflections aloud.
+* **Express Gateway Proxy**: Secure multipart and binary streaming proxies (`/api/voice/stt` and `/api/voice/tts`) safeguarding API keys.
 
 ---
 

@@ -6,7 +6,15 @@ import { useMemory } from '../../../context/MemoryContext';
 import DailyPrompt from '../../DailyPrompt/DailyPrompt';
 import MicOrb from '../../MicOrb/MicOrb';
 import MemorySafeguardModal from '../../MemorySafeguardModal/MemorySafeguardModal';
+import VoiceCompanion from '../../VoiceCompanion/VoiceCompanion';
+import {
+  PROMPTS, reactionFor, parseDayReply, parseMoreReply, timestampFor,
+} from '../../../utils/voiceCompanion';
 import './SlateSection.css';
+
+const REPLY_LISTEN_MS = 6000;      // how long Gnani listens for a short spoken answer
+const COMPANION_LANG = 'en-IN';    // companion prompts are written in English
+const DONE_BUBBLE_MS = 7000;       // how long the goodbye bubble stays on screen
 
 /**
  * SlateSection — Phase 2 Overhaul: Voice Sanctuary & Gnani Indic Voice AI.
@@ -205,12 +213,13 @@ function VoiceSanctuary({
   draftText, 
   interimText, 
   onOrbClick, 
-  onClose, 
-  onSave, 
+  onClose,
+  onSave,
   onRecordAgain,
   isSubmitting,
   selectedLanguage,
-  onLanguageChange
+  onLanguageChange,
+  companionNode,
 }) {
   const scrollContainerRef = useRef(null);
   const isAutoScrollEnabled = useRef(true);
@@ -270,7 +279,9 @@ function VoiceSanctuary({
           </div>
         </div>
 
-        {isReviewMode && (
+        {companionNode}
+
+        {isReviewMode && !companionNode && (
           <div className="slate-voice-sanctuary__actions">
             <button 
               className="slate-voice-sanctuary__btn" 
@@ -504,6 +515,20 @@ export default function SlateSection() {
 
   const [selectedLanguage, setSelectedLanguage] = useState('indic-auto');
 
+  /* ── Voice Companion (Gnani talks back) ─────────────────── */
+  // companion: { step: 'day'|'pickDate'|'more'|'adding'|'saving'|'done'|'info', message } | null
+  const [companion, setCompanion] = useState(null);
+  const companionRunRef = useRef(0);       // bumps whenever the conversation is interrupted
+  const entryDateRef    = useRef(null);    // the day this entry is about, once decided
+  const appendNextRef   = useRef(false);   // next voice transcript adds to the draft instead of replacing it
+  const retryRef        = useRef(0);
+  const pendingSaveRef  = useRef(null);    // { timestamp, entryDate } of a companion-driven save
+  const draftRef        = useRef(draft);
+  // Latest handlers, so async conversation steps never run stale closures.
+  const latest = useRef({});
+
+  useEffect(() => { draftRef.current = draft; }, [draft]);
+
   /* ── Gnani Indic Voice AI (REST Mode) ──────────────────── */
   const {
     orbState,
@@ -513,34 +538,196 @@ export default function SlateSection() {
     errorMessage: speechError,
     startListening,
     stopListening,
+    listenOnce,
+    abortListening,
     resetTranscript,
     speak: speakGnani,
+    cancelSpeech,
+    setLanguage,
   } = useGnaniVoice({
     initialLanguage: selectedLanguage,
     onTranscript: (text) => {
-      if (text && text.trim()) {
-        setDraft((prev) => {
-          const appended = prev.trim() ? `${prev.trim()} ${text.trim()}` : text.trim();
-          const max = activeMode === 'snippet' ? SNIPPET_MAX_CHARS : DEEP_MAX_CHARS;
-          const merged = appended.slice(0, max);
-          setCharCount(merged.length);
-          return merged;
-        });
-        setInputMode('voice');
-        setVoiceReviewMode(true);
+      const clean = (text || '').trim();
+      const append = appendNextRef.current;
+      appendNextRef.current = false;
+      if (!clean) {
+        latest.current.onHeardNothing?.(append);
+        return;
       }
-    },
-    onTranscriptUpdate: (text) => {
-      const max = activeMode === 'snippet' ? SNIPPET_MAX_CHARS : DEEP_MAX_CHARS;
-      const merged = text.slice(0, max);
-      setDraft(merged);
-      setCharCount(merged.length);
+      const mode = latest.current.activeMode || activeMode;
+      console.log('[SlateSection] onTranscript received:', clean, append ? '(appending)' : '');
+      const max = mode === 'snippet' ? SNIPPET_MAX_CHARS : DEEP_MAX_CHARS;
+      const base = append ? (draftRef.current || '').trim() : '';
+      const freshText = (base ? `${base} ${clean}` : clean).slice(0, max);
+      draftRef.current = freshText;
+      setDraft(freshText);
+      setCharCount(freshText.length);
       setInputMode('voice');
-      if (textareaRef.current) {
-        textareaRef.current.scrollTop = textareaRef.current.scrollHeight;
-      }
+      setTimeout(() => {
+        if (mode === 'snippet' && snippetRef.current) {
+          snippetRef.current.focus();
+        } else if (textareaRef.current) {
+          textareaRef.current.scrollTop = textareaRef.current.scrollHeight;
+        }
+      }, 60);
+      latest.current.onVoiceEntry?.(clean);
     },
   });
+
+  /* ── Companion conversation flow ─────────────────────────
+     After every spoken entry Gnani reacts, asks which day it is about,
+     asks whether there is anything else, then saves and says goodbye.
+     Every question can be answered by voice or with the on-screen buttons. */
+
+  /** Show + speak a line. With listen, then record a short reply. Returns null if interrupted. */
+  const companionSay = async (step, message, { listen = false } = {}) => {
+    const runId = ++companionRunRef.current;
+    setCompanion({ step, message });
+    await speakGnani(message, COMPANION_LANG);
+    if (companionRunRef.current !== runId) return null;
+    if (!listen) return '';
+    const reply = await listenOnce(REPLY_LISTEN_MS);
+    if (companionRunRef.current !== runId) return null;
+    console.log('[SlateSection] Companion heard reply:', reply);
+    return reply;
+  };
+
+  /** Stop Gnani talking / listening-for-a-reply, without closing the bubble. */
+  const interruptCompanion = () => {
+    companionRunRef.current++;
+    cancelSpeech();
+    if (companion && companion.step !== 'adding') abortListening();
+  };
+
+  const closeCompanion = () => {
+    interruptCompanion();
+    setCompanion(null);
+    entryDateRef.current = null;
+    appendNextRef.current = false;
+    retryRef.current = 0;
+  };
+
+  const onVoiceEntry = async (newPart) => {
+    retryRef.current = 0;
+    const reaction = reactionFor(newPart);
+    if (!entryDateRef.current) {
+      const reply = await companionSay('day', PROMPTS.askDay(reaction), { listen: true });
+      latest.current.handleDayReply(reply);
+    } else {
+      const reply = await companionSay('more', PROMPTS.askMore(reaction), { listen: true });
+      latest.current.handleMoreReply(reply);
+    }
+  };
+
+  const onHeardNothing = async (wasAdding) => {
+    if (wasAdding && draftRef.current.trim()) {
+      const reply = await companionSay('more', PROMPTS.askMoreAgain, { listen: true });
+      latest.current.handleMoreReply(reply);
+    } else if (!companion) {
+      companionSay('info', PROMPTS.heardNothing);
+    }
+  };
+
+  const handleDayReply = async (reply) => {
+    if (reply === null) return;
+    const parsed = parseDayReply(reply);
+    if (!parsed) {
+      if (retryRef.current++ < 1) {
+        const again = await companionSay('day', PROMPTS.askDayAgain, { listen: true });
+        latest.current.handleDayReply(again);
+      }
+      return; // second miss: leave the buttons waiting
+    }
+    if (parsed.kind === 'today') return latest.current.chooseDate(new Date());
+    if (parsed.kind === 'date') return latest.current.chooseDate(parsed.date);
+    return latest.current.askWhichDay();
+  };
+
+  const askWhichDay = async () => {
+    interruptCompanion();
+    const reply = await companionSay('pickDate', PROMPTS.askWhichDay, { listen: true });
+    if (reply === null) return;
+    const parsed = parseDayReply(reply);
+    if (parsed && parsed.kind === 'date') return latest.current.chooseDate(parsed.date);
+    if (parsed && parsed.kind === 'today' && /today|aaj|आज|ఈరోజు|இன்று|ಇಂದು/i.test(reply)) {
+      return latest.current.chooseDate(new Date());
+    }
+    companionSay('pickDate', PROMPTS.askWhichDayAgain);
+  };
+
+  const chooseDate = async (date) => {
+    interruptCompanion();
+    entryDateRef.current = date;
+    retryRef.current = 0;
+    const reply = await companionSay('more', PROMPTS.dayConfirmed(date), { listen: true });
+    latest.current.handleMoreReply(reply);
+  };
+
+  const handleMoreReply = async (reply) => {
+    if (reply === null) return;
+    const kind = parseMoreReply(reply);
+    if (kind === 'no') return latest.current.saveNow();
+    if (kind === 'yes') return latest.current.addMore();
+    if (kind === 'content') {
+      // They simply carried on talking — that's more diary, not an answer.
+      const mode = latest.current.activeMode;
+      const max = mode === 'snippet' ? SNIPPET_MAX_CHARS : DEEP_MAX_CHARS;
+      const next = `${draftRef.current.trim()} ${reply.trim()}`.trim().slice(0, max);
+      draftRef.current = next;
+      setDraft(next);
+      setCharCount(next.length);
+      return latest.current.onVoiceEntry(reply);
+    }
+    if (retryRef.current++ < 1) {
+      const again = await companionSay('more', PROMPTS.askMoreAgain, { listen: true });
+      latest.current.handleMoreReply(again);
+    }
+  };
+
+  const addMore = async () => {
+    interruptCompanion();
+    const ok = await companionSay('adding', PROMPTS.goAhead);
+    if (ok === null) return;
+    appendNextRef.current = true;
+    resetTranscript();
+    setInputMode('voice');
+    await startListening();
+  };
+
+  const saveNow = () => {
+    interruptCompanion();
+    const entryDate = entryDateRef.current || new Date();
+    pendingSaveRef.current = { timestamp: timestampFor(entryDate), entryDate };
+    setCompanion({ step: 'saving', message: PROMPTS.saving });
+    latest.current.executeSubmit(false);
+  };
+
+  const finishCompanionSave = async (result) => {
+    const pending = pendingSaveRef.current;
+    if (!pending) return;
+    if (result && (result.status === 'tripwire_alert' || result.status === 'forget_confirmation' || result.status === 'verification_required')) {
+      setCompanion(null); // another dialog takes over; keep pendingSaveRef for "save anyway"
+      return;
+    }
+    pendingSaveRef.current = null;
+    entryDateRef.current = null;
+    if (result && result.status === 'error') {
+      companionSay('info', PROMPTS.saveFailed);
+      return;
+    }
+    const ok = await companionSay('done', PROMPTS.saved(pending.entryDate));
+    if (ok === null) return;
+    const runId = companionRunRef.current;
+    setTimeout(() => {
+      if (companionRunRef.current === runId) setCompanion(null);
+    }, DONE_BUBBLE_MS);
+  };
+
+  const handleLanguageChange = useCallback((newLang) => {
+    console.log('[SlateSection] Language selected:', newLang);
+    setSelectedLanguage(newLang);
+    if (setLanguage) setLanguage(newLang);
+  }, [setLanguage]);
 
   useEffect(() => {
     if (speechError) setPermError(speechError);
@@ -551,10 +738,9 @@ export default function SlateSection() {
     localStorage.setItem(SLATE_CACHE_KEY, draft);
   }, [draft]);
 
-
-
   const handleModeSwitch = useCallback((mode) => {
     if (mode === activeMode) return;
+    latest.current.closeCompanion?.();
     if (orbState === 'listening') stopListening();
     setActiveMode(mode);
     setDraft('');
@@ -569,16 +755,36 @@ export default function SlateSection() {
   }, [activeMode, orbState, stopListening, resetTranscript]);
 
   const handleOrbClick = useCallback(async () => {
+    console.log('[SlateSection] handleOrbClick invoked. orbState:', orbState, 'activeMode:', activeMode);
     if (orbState === 'listening') {
-      const res = await stopListening();
-      if ((res && res.trim()) || draft.trim()) setVoiceReviewMode(true);
-    } else if (orbState === 'idle' || orbState === 'error') {
+      await stopListening();
+      if (activeMode === 'snippet') {
+        setTimeout(() => {
+          if (snippetRef.current) snippetRef.current.focus();
+        }, 60);
+      } else {
+        setVoiceReviewMode(true);
+      }
+    } else if (orbState === 'idle' || orbState === 'error' || orbState === 'speaking') {
+      console.log('[SlateSection] Starting voice recording with language:', selectedLanguage);
+      const c = latest.current;
+      const midConversation = c.companion && !['done', 'info', 'saving'].includes(c.companion.step);
+      if (midConversation && draftRef.current.trim()) {
+        // Tapping the mic mid-conversation means "let me add more".
+        c.interruptCompanion();
+        appendNextRef.current = true;
+        setCompanion({ step: 'adding', message: "I'm listening. Tap the microphone when you're finished." });
+      } else if (c.companion) {
+        c.closeCompanion();
+      }
       resetTranscript();
       setInputMode('voice');
-      setVoiceReviewMode(false);
-      startListening();
+      if (activeMode !== 'snippet') {
+        setVoiceReviewMode(false);
+      }
+      await startListening();
     }
-  }, [orbState, draft, startListening, stopListening, resetTranscript]);
+  }, [orbState, startListening, stopListening, resetTranscript, activeMode, selectedLanguage]);
 
   const handleChange = useCallback((e) => {
     const val = e.target.value;
@@ -591,22 +797,26 @@ export default function SlateSection() {
   }, [activeMode]);
 
   const executeSubmit = useCallback((forceSave) => {
-    if (!draft.trim() || isSubmitting) return;
+    const currentDraft = draftRef.current || draft;
+    if (!currentDraft.trim() || isSubmitting) return;
 
     if (orbState === 'listening') stopListening();
 
     const isSnippet = activeMode === 'snippet';
     const max = isSnippet ? SNIPPET_MAX_CHARS : DEEP_MAX_CHARS;
-    const activeInputString = draft.trim().slice(0, max);
+    const activeInputString = currentDraft.trim().slice(0, max);
     const wasVoice = inputMode === 'voice';
+    const companionSave = pendingSaveRef.current; // set when Gnani is driving the save
 
     setSubmitting(true);
 
     submitMemory(activeInputString, wasVoice, isSnippet, forceSave, (result) => {
       setSubmitting(false);
 
+      if (companionSave) latest.current.finishCompanionSave?.(result);
+
       if (!forceSave && result && result.status === 'tripwire_alert') {
-        if (wasVoice) speakFeedback('Tripwire alert detected.');
+        if (wasVoice && !companionSave) speakFeedback('Tripwire alert detected.');
         setTripwireAlert(result.data);
         return;
       }
@@ -620,14 +830,14 @@ export default function SlateSection() {
         setSafeguardTopic(result.data.topic);
         return;
       }
-      
+
       if (result && result.status === 'error') {
-        if (wasVoice) speakFeedback('Failed to save your entry. Please try again.');
+        if (wasVoice && !companionSave) speakFeedback('Failed to save your entry. Please try again.');
         return;
       }
-      
-      // Post-Ingest State Splice
-      if (wasVoice) {
+
+      // Post-Ingest State Splice (the companion speaks its own goodbye)
+      if (wasVoice && !companionSave) {
         speakFeedback('Your entry is safely recorded.');
       }
 
@@ -641,7 +851,7 @@ export default function SlateSection() {
       setTimeout(() => {
         if (isSnippet && snippetRef.current) snippetRef.current.focus();
       }, 80);
-    });
+    }, companionSave ? companionSave.timestamp : undefined);
   }, [draft, isSubmitting, inputMode, activeMode, orbState, stopListening, resetTranscript, submitMemory]);
 
   const handleSubmit = useCallback((e) => {
@@ -651,8 +861,38 @@ export default function SlateSection() {
     if (e && e.stopPropagation) {
       e.stopPropagation();
     }
+    // If Gnani is mid-conversation, save through it so the chosen day and goodbye are kept.
+    const c = latest.current;
+    if (c.companion && !['done', 'info', 'saving'].includes(c.companion.step)) {
+      c.saveNow();
+      return;
+    }
+    if (c.companion) c.closeCompanion();
     executeSubmit(false);
   }, [executeSubmit]);
+
+  // Refresh the handler table every render (read by async conversation steps).
+  latest.current = {
+    activeMode, companion, executeSubmit,
+    onVoiceEntry, onHeardNothing, handleDayReply, handleMoreReply, askWhichDay,
+    chooseDate, addMore, saveNow, finishCompanionSave, interruptCompanion, closeCompanion,
+  };
+
+  const companionNode = companion ? (
+    <VoiceCompanion
+      companion={companion}
+      orbState={orbState}
+      isSubmitting={isSubmitting}
+      variant={activeMode === 'deep' && (orbState === 'listening' || voiceReviewMode) ? 'sanctuary' : 'inline'}
+      onToday={() => chooseDate(new Date())}
+      onYesterday={() => { const d = new Date(); d.setDate(d.getDate() - 1); chooseDate(d); }}
+      onAnotherDay={askWhichDay}
+      onPickDate={chooseDate}
+      onAddMore={addMore}
+      onSaveNow={saveNow}
+      onClose={closeCompanion}
+    />
+  ) : null;
 
   const handleKeyDown = useCallback((e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
@@ -692,7 +932,7 @@ export default function SlateSection() {
     ? draft + interimText
     : draft;
 
-  const isVoiceSanctuaryOpen = orbState === 'listening' || voiceReviewMode;
+  const isVoiceSanctuaryOpen = activeMode === 'deep' && (orbState === 'listening' || voiceReviewMode);
 
   return (
     <section className="slate-section" aria-label="The Slate — Journal Workspace">
@@ -709,28 +949,30 @@ export default function SlateSection() {
       </div>
 
 
-      {/* ── Mode Switcher ── */}
+      {/* ── Mode Switcher & Voice Language ── */}
       <div className="slate-mode-switcher" role="tablist" aria-label="Compose mode">
-        <button
-          id="slate-tab-snippet"
-          role="tab"
-          aria-selected={activeMode === 'snippet'}
-          className={`slate-mode-tab ${activeMode === 'snippet' ? 'slate-mode-tab--active' : ''}`}
-          onClick={() => handleModeSwitch('snippet')}
-        >
-          <span className="slate-mode-tab__icon">⚡</span>
-          Quick Snippets
-        </button>
-        <button
-          id="slate-tab-deep"
-          role="tab"
-          aria-selected={activeMode === 'deep'}
-          className={`slate-mode-tab ${activeMode === 'deep' ? 'slate-mode-tab--active' : ''}`}
-          onClick={() => handleModeSwitch('deep')}
-        >
-          <span className="slate-mode-tab__icon">📖</span>
-          Deep Diary
-        </button>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)' }}>
+          <button
+            id="slate-tab-snippet"
+            role="tab"
+            aria-selected={activeMode === 'snippet'}
+            className={`slate-mode-tab ${activeMode === 'snippet' ? 'slate-mode-tab--active' : ''}`}
+            onClick={() => handleModeSwitch('snippet')}
+          >
+            <span className="slate-mode-tab__icon">⚡</span>
+            Quick Snippets
+          </button>
+          <button
+            id="slate-tab-deep"
+            role="tab"
+            aria-selected={activeMode === 'deep'}
+            className={`slate-mode-tab ${activeMode === 'deep' ? 'slate-mode-tab--active' : ''}`}
+            onClick={() => handleModeSwitch('deep')}
+          >
+            <span className="slate-mode-tab__icon">📖</span>
+            Deep Diary
+          </button>
+        </div>
       </div>
 
       {permError && (
@@ -768,17 +1010,25 @@ export default function SlateSection() {
                 }
               }}
               onKeyDown={handleSnippetKeyDown}
-              placeholder="Quick thought… press ↵ to capture"
+              placeholder={orbState === 'listening' ? 'Listening… speak now in your chosen language' : 'Quick thought… press ↵ to capture'}
               aria-label="Quick snippet input — press Enter to save"
               disabled={isSubmitting}
               autoComplete="off"
               spellCheck
             />
+
+            {/* Language Selector UI dropdown next to microphone icon inside input bar */}
+            <VoiceLanguagePicker
+              selectedLanguage={selectedLanguage}
+              onLanguageChange={handleLanguageChange}
+              compact
+            />
             
             <button
-              className="slate-compose__snippet-mic"
+              className={`slate-compose__snippet-mic ${orbState === 'listening' ? 'slate-compose__snippet-mic--listening' : ''}`}
               onClick={handleOrbClick}
-              aria-label="Voice input"
+              aria-label={orbState === 'listening' ? 'Stop voice recording' : 'Voice input'}
+              title={orbState === 'listening' ? 'Listening… Tap to transcribe' : 'Record voice with Gnani Indic AI'}
             >
               <svg viewBox="0 0 24 24" fill="none" width="18" height="18" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"></path>
@@ -836,6 +1086,11 @@ export default function SlateSection() {
               </span>
               <div className="slate-compose__actions">
                 <span className="slate-compose__shortcut" aria-hidden="true">⌘↵ to save</span>
+                <VoiceLanguagePicker
+                  selectedLanguage={selectedLanguage}
+                  onLanguageChange={handleLanguageChange}
+                  compact
+                />
                 <button
                   type="button"
                   className={`slate-compose__mic-inline ${orbState === 'listening' ? 'slate-compose__mic-inline--listening' : ''}`}
@@ -869,6 +1124,9 @@ export default function SlateSection() {
             </div>
           </div>
         )}
+
+        {/* Gnani's conversational bubble (inside the sanctuary when that is open) */}
+        {!isVoiceSanctuaryOpen && companionNode}
       </div>
 
       {/* ── Mic Orb — Deep mode only ── */}
@@ -932,18 +1190,24 @@ export default function SlateSection() {
           interimText={interimText}
           onOrbClick={handleOrbClick}
           onClose={() => {
+            closeCompanion();
             stopListening();
             setVoiceReviewMode(false);
           }}
           onSave={handleSubmit}
           onRecordAgain={() => {
+            closeCompanion();
             setDraft('');
+            draftRef.current = '';
             setCharCount(0);
             resetTranscript();
             setVoiceReviewMode(false);
             startListening();
           }}
           isSubmitting={isSubmitting}
+          selectedLanguage={selectedLanguage}
+          onLanguageChange={setSelectedLanguage}
+          companionNode={companionNode}
         />
       )}
 
@@ -977,6 +1241,8 @@ export default function SlateSection() {
         <TripwireModal 
           alertData={tripwireAlert} 
           onDiscard={() => {
+            pendingSaveRef.current = null;
+            entryDateRef.current = null;
             setTripwireAlert(null);
             setDraft('');
             setCharCount(0);

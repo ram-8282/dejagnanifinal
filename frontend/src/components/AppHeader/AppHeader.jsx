@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react';
 import { useNavigation } from '../../context/NavigationContext';
 import { useAuth } from '../../context/AuthContext';
 import ThemeToggle from '../ThemeToggle/ThemeToggle';
+import VoicePicker from '../VoicePicker/VoicePicker';
 import './AppHeader.css';
 
 /**
@@ -40,6 +41,7 @@ export default function AppHeader() {
 
         {/* Right controls */}
         <div className="app-header__controls">
+          <VoicePicker variant="icon" />
           <ThemeToggle />
 
           {/* Profile avatar button */}

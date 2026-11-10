@@ -3,6 +3,7 @@ import { useNavigation } from '../../context/NavigationContext';
 import { useTheme } from '../../context/ThemeContext';
 import { useAuth } from '../../context/AuthContext';
 import ThemeToggle from '../ThemeToggle/ThemeToggle';
+import VoicePicker from '../VoicePicker/VoicePicker';
 import './SidebarNav.css';
 
 const TABS = [
@@ -133,6 +134,9 @@ export default function SidebarNav() {
       {/* ── Bottom Controls ── */}
       <div className="sidebar__footer">
         <div className="sidebar__divider" aria-hidden="true" />
+
+        {/* Voice row — Gnani voice chooser */}
+        <VoicePicker variant="row" />
 
         {/* Theme row */}
         <div className="sidebar__footer-inner">

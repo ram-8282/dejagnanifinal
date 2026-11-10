@@ -1,12 +1,13 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
-import { useSpeechRecognition } from '../../../hooks/useSpeechRecognition';
+import { useGnaniVoice } from '../../../hooks/useGnaniVoice';
+import VoiceLanguagePicker from '../../VoiceLanguagePicker/VoiceLanguagePicker';
 import MicOrb from '../../MicOrb/MicOrb';
 import MemorySafeguardModal from '../../MemorySafeguardModal/MemorySafeguardModal';
 import { useMemory } from '../../../context/MemoryContext';
 import './OracleSection.css';
 
 /**
- * OracleSection — Phase 6: Choice Shield UI & API Integration.
+ * OracleSection — Phase 6: Choice Shield UI & API Integration + Gnani Indic Voice AI.
  * 
  * Ambient conversational question terminal.
  * Parses { data: { food, activity, reason } } into a Choice Shield.
@@ -33,6 +34,8 @@ export default function OracleSection() {
   const [safeguardTopic, setSafeguardTopic] = useState(null);
   const [feedbackDeleteConfig, setFeedbackDeleteConfig] = useState(null);
   const [showScrollToBottom, setShowScrollToBottom] = useState(false);
+  const [selectedLanguage, setSelectedLanguage] = useState('indic-auto');
+  const [speakingCardId, setSpeakingCardId] = useState(null);
   const inputRef = useRef(null);
   const feedRef = useRef(null);
   const bottomRef = useRef(null);
@@ -73,7 +76,7 @@ export default function OracleSection() {
     "What did I learn this week?",
   ];
 
-  /* ── Speech recognition ───────────────────────────────── */
+  /* ── Gnani Indic Voice AI ──────────────────────────────── */
   const {
     orbState,
     interimText,
@@ -81,25 +84,52 @@ export default function OracleSection() {
     startListening,
     stopListening,
     resetTranscript,
-  } = useSpeechRecognition({
+    speak: speakGnani,
+    cancelSpeech,
+  } = useGnaniVoice({
+    initialLanguage: selectedLanguage,
+    onTranscript: (text) => {
+      if (text && text.trim()) {
+        setQuery(text.trim());
+      }
+    },
     onTranscriptUpdate: (text) => {
       setQuery(text);
     },
     onFinalResult: (text) => {
-      if (text.trim()) {
-        setQuery(text);
+      if (text && text.trim()) {
+        setQuery(text.trim());
       }
     }
   });
 
-  const handleOrbClick = useCallback(() => {
+  const handleToggleSpeak = useCallback((cardId, text) => {
+    if (speakingCardId === cardId) {
+      cancelSpeech();
+      setSpeakingCardId(null);
+    } else {
+      setSpeakingCardId(cardId);
+      speakGnani(text, selectedLanguage);
+    }
+  }, [speakingCardId, cancelSpeech, speakGnani, selectedLanguage]);
+
+  useEffect(() => {
+    if (orbState !== 'speaking' && speakingCardId) {
+      setSpeakingCardId(null);
+    }
+  }, [orbState, speakingCardId]);
+
+  const handleOrbClick = useCallback(async () => {
     if (orbState === 'listening') {
-      stopListening();
+      const res = await stopListening();
+      if (res && res.trim()) {
+        setQuery(res.trim());
+      }
     } else if (orbState === 'idle' || orbState === 'error') {
       resetTranscript();
       startListening();
     }
-  }, [orbState, startListening, stopListening, resetTranscript]);
+  }, [orbState, startListening, stopListening, resetTranscript, setQuery]);
 
 
   const sendQuery = useCallback(async (text) => {
@@ -322,16 +352,36 @@ export default function OracleSection() {
                             </div>
                           </div>
 
-                          <time className="oracle-message__time" dateTime={card.timestamp}>
-                            {formatTime(card.timestamp)}
-                          </time>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                            <button
+                              type="button"
+                              className={`choice-shield__btn-speak ${speakingCardId === card.id ? 'choice-shield__btn-speak--active' : ''}`}
+                              onClick={() => handleToggleSpeak(card.id, `${card.answer.headline || ''}. ${card.answer.primary_content || ''}`)}
+                              title={speakingCardId === card.id ? 'Stop voice' : 'Listen in natural Indic voice (Gnani AI)'}
+                              aria-label={speakingCardId === card.id ? 'Stop voice' : 'Listen to insight'}
+                            >
+                              {speakingCardId === card.id ? '⏹ Stop' : '🔊 Listen'}
+                            </button>
+                            <time className="oracle-message__time" dateTime={card.timestamp}>
+                              {formatTime(card.timestamp)}
+                            </time>
+                          </div>
                         </div>
                       </div>
                     ) : (
                       /* ── Standard Text Bubble ── */
                       <div className="oracle-message__bubble">
                         <p className="oracle-message__text">{card.answer.text}</p>
-                        <div className="oracle-message__footer">
+                        <div className="oracle-message__footer" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px' }}>
+                          <button
+                            type="button"
+                            className={`choice-shield__btn-speak ${speakingCardId === card.id ? 'choice-shield__btn-speak--active' : ''}`}
+                            onClick={() => handleToggleSpeak(card.id, card.answer.text)}
+                            title={speakingCardId === card.id ? 'Stop voice' : 'Listen in natural Indic voice (Gnani AI)'}
+                            aria-label={speakingCardId === card.id ? 'Stop voice' : 'Listen to insight'}
+                          >
+                            {speakingCardId === card.id ? '⏹ Stop' : '🔊 Listen'}
+                          </button>
                           <time className="oracle-message__time" dateTime={card.timestamp}>
                             {formatTime(card.timestamp)}
                           </time>
@@ -413,6 +463,17 @@ export default function OracleSection() {
             disabled={isOracleThinking}
             autoComplete="off"
           />
+
+          {/* Voice language selector inside the input bar, next to the mic */}
+          <div className="oracle-input-bar__lang">
+            <VoiceLanguagePicker
+              selectedLanguage={selectedLanguage}
+              onLanguageChange={setSelectedLanguage}
+              disabled={orbState === 'listening' || orbState === 'processing'}
+              compact
+            />
+          </div>
+
           <button
             id="oracle-send-btn"
             className="oracle-input-bar__send"

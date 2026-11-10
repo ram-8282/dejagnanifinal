@@ -2,19 +2,22 @@
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  background: var(--color-bg-surface, rgba(255, 255, 255, 0.05));
-  border: 1px solid var(--color-border, rgba(255, 255, 255, 0.12));
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  padding: 4px 10px;
+  background: rgba(26, 26, 36, 0.75);
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  padding: 5px 12px;
   border-radius: var(--radius-full, 9999px);
   transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
   font-family: inherit;
+  position: relative;
+  z-index: 5;
 }
 
 .voice-lang-picker:hover {
+  background: rgba(32, 32, 45, 0.9);
   border-color: var(--color-accent-slate, #e0a96d);
-  box-shadow: 0 0 12px rgba(224, 169, 109, 0.15);
+  box-shadow: 0 0 16px rgba(224, 169, 109, 0.25);
 }
 
 .voice-lang-picker__label {

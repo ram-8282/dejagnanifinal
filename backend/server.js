@@ -1,8 +1,15 @@
-require('dotenv').config();
+const path = require('path');
+require('dotenv').config({ path: path.resolve(__dirname, '.env') });
 const express = require('express');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
+const multer = require('multer');
+
+const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 25 * 1024 * 1024 } // 25 MB limit
+});
 
 const app = express();
 const PORT = process.env.PORT || 5051;
@@ -11,6 +18,13 @@ const FASTAPI_URL = 'http://127.0.0.1:8000';
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_ANON_KEY;
+
+// Gnani Voice AI Config
+const GNANI_BASE_URL = process.env.GNANI_BASE_URL || 'https://api.vachana.ai';
+const GNANI_API_KEY = process.env.GNANI_API_KEY || '';
+const GNANI_STT_MODEL = process.env.GNANI_STT_MODEL || 'prisma-v3.0';
+const GNANI_DEFAULT_LANG = process.env.GNANI_DEFAULT_LANG || 'indic-auto';
+const GNANI_TTS_VOICE = process.env.GNANI_TTS_VOICE || 'Nalini';
 
 
 // Create an authenticated client if token provided, otherwise fallback to Anon
@@ -168,6 +182,14 @@ app.post('/api/memory/ingest', async (req, res) => {
         if (supabase) {
             const payload = { content: text, profile_id: req.userProfile };
 
+            // Honour a client-supplied timestamp so entries about an earlier day
+            // ("this happened yesterday") land on the right page of The Archives.
+            // Ignore anything unparsable or in the future (5 min clock-skew allowance).
+            const entryTime = timestamp ? new Date(timestamp) : null;
+            if (entryTime && !isNaN(entryTime.getTime()) && entryTime.getTime() <= Date.now() + 5 * 60 * 1000) {
+                payload.created_at = entryTime.toISOString();
+            }
+
             const { data, error } = await supabase
                 .from('journal_slates')
                 .insert([payload])
@@ -244,9 +266,13 @@ app.post('/api/memory/recover', async (req, res) => {
     } catch (error) {
         console.error('Oracle Pipeline Error:', error);
         // Graceful Degradation: return a structured fail state rather than outright breaking UI
-        res.status(500).json({
+        const reason = String((error && (error.detail || error.message)) || '');
+        const busy = /503|429|high demand|unavailable|overloaded|rate limit/i.test(reason);
+        res.status(busy ? 503 : 500).json({
             status: 'error',
-            message: 'The Oracle bridge is temporarily unresponsive. Data remains safe.',
+            message: busy
+                ? 'The AI model is busy (high demand). Please try again in a minute.'
+                : `The Oracle bridge is temporarily unresponsive. Data remains safe. ${reason.slice(0, 160)}`,
             details: error.message || error
         });
     }
@@ -263,7 +289,8 @@ app.get('/api/memory/blindspots', async (req, res) => {
         res.status(200).json(result);
     } catch (error) {
         console.error('Analytics Pipeline Error:', error);
-        res.status(500).json({ status: 'error', message: 'Internal server error during blindspot lookup.', details: error });
+        const reason = (error && (error.detail || error.message)) || 'Internal server error during blindspot lookup.';
+        res.status(500).json({ status: 'error', message: String(reason).slice(0, 300), details: error });
     }
 });
 
@@ -420,29 +447,45 @@ app.get('/api/voice/status', (req, res) => {
 // 2. Speech-to-Text (STT) via Gnani Prisma v3 REST API
 app.post('/api/voice/stt', upload.single('audio'), async (req, res) => {
     try {
+        console.log('[GNANI STT] Incoming request to /api/voice/stt');
+        console.log('[GNANI STT] req.file details:', req.file ? {
+            fieldname: req.file.fieldname,
+            originalname: req.file.originalname,
+            mimetype: req.file.mimetype,
+            size: req.file.size,
+            bufferLength: req.file.buffer ? req.file.buffer.length : 0
+        } : 'No file received in req.file');
+        console.log('[GNANI STT] req.body:', req.body);
+
         if (!GNANI_API_KEY) {
-            return res.status(200).json({
-                status: 'fallback',
-                fallback: true,
-                code: 'GNANI_KEY_NOT_CONFIGURED',
-                transcript: '',
-                message: 'GNANI_API_KEY is not configured in backend/.env, falling back to Web Speech.'
+            console.error('[GNANI STT] GNANI_API_KEY is missing from environment.');
+            return res.status(500).json({
+                error: 'GNANI_KEY_NOT_CONFIGURED: GNANI_API_KEY is not configured in backend/.env'
             });
         }
 
         if (!req.file || !req.file.buffer) {
-            return res.status(400).json({ status: 'error', message: "No audio file provided in 'audio' field." });
+            console.error('[GNANI STT] Error: No audio file provided in "audio" field.');
+            return res.status(400).json({ error: "No audio file provided in 'audio' field." });
         }
 
-        const language_code = req.body.language || req.query.language || GNANI_DEFAULT_LANG;
+        const language_code = req.body.language_code || req.body.language || req.query.language || GNANI_DEFAULT_LANG;
         const model = req.body.model || req.query.model || GNANI_STT_MODEL;
+        // With indic-auto, Gnani renders output in the detected language's native script,
+        // so Indian-accented English often comes back in Devanagari. 'codemix' (Prisma v3 only)
+        // keeps English words in Latin script while leaving Indic words in their own script.
+        const isV3 = model.startsWith('prisma-v3');
+        const format = req.body.format || req.query.format || (isV3 ? 'codemix' : 'verbatim');
 
         const formData = new FormData();
-        const audioBlob = new Blob([req.file.buffer], { type: req.file.mimetype || 'audio/webm' });
-        const filename = req.file.originalname || 'speech.webm';
+        const audioBlob = new Blob([req.file.buffer], { type: 'audio/wav' });
+        const filename = 'recording.wav';
         formData.append('audio_file', audioBlob, filename);
         formData.append('model', model);
         formData.append('language_code', language_code);
+        formData.append('format', format);
+
+        console.log(`[GNANI STT] Forwarding to Gnani STT API: ${GNANI_BASE_URL}/stt/v3 (model=${model}, lang=${language_code}, format=${format}, file=${filename}, size=${req.file.size} bytes, type=audio/wav)`);
 
         const response = await fetch(`${GNANI_BASE_URL}/stt/v3`, {
             method: 'POST',
@@ -452,41 +495,38 @@ app.post('/api/voice/stt', upload.single('audio'), async (req, res) => {
             body: formData
         });
 
+        console.log(`[GNANI STT] Gnani STT API response status: ${response.status}`);
+
         let data;
         try {
             data = await response.json();
         } catch (e) {
             const rawText = await response.text();
-            throw new Error(`Gnani STT returned non-JSON response: ${rawText}`);
+            console.error('[GNANI STT] Non-JSON response from Gnani STT API:', rawText);
+            return res.status(500).json({ error: `Gnani STT returned non-JSON response: ${rawText}` });
         }
 
         if (!response.ok) {
-            console.error('Gnani STT API Error:', response.status, data);
-            return res.status(200).json({
-                status: 'fallback',
-                fallback: true,
-                transcript: '',
-                message: data.message || data.error || 'Gnani STT transcription failed, falling back to Web Speech.',
-                details: data
-            });
+            console.error('[GNANI STT] Gnani STT API non-200 Error:', response.status, data);
+            return res.status(500).json({ error: data });
         }
 
         const transcript = data.transcript || data.text || (data.result && data.result[0]?.transcript) || '';
+        const detectedLanguage = data.detected_language_code || language_code;
+        console.log(`[GNANI STT] Transcription success! (detected=${data.detected_language_code || 'n/a'}) Transcript:`, transcript);
 
         return res.json({
             status: 'success',
             transcript: transcript.trim(),
             confidence: data.confidence || (data.result && data.result[0]?.confidence) || 1.0,
-            language: language_code,
+            language: detectedLanguage,
+            requestedLanguage: language_code,
             raw: data
         });
     } catch (error) {
-        console.error('Gnani STT Proxy Failure:', error);
-        return res.status(200).json({
-            status: 'fallback',
-            fallback: true,
-            transcript: '',
-            message: error.message || 'Internal error while calling Gnani STT, falling back to Web Speech.',
+        console.error('[GNANI STT] Proxy exception:', error);
+        return res.status(500).json({
+            error: error.message || 'Internal error while calling Gnani STT API.',
             details: error
         });
     }
@@ -509,12 +549,15 @@ app.post('/api/voice/tts', async (req, res) => {
         }
 
         const lang = language && language !== 'indic-auto' ? language : 'en-IN';
+        // Voice comes from the in-app Voice picker; accept only a plain voice name.
+        const safeVoice = typeof voice === 'string' && /^[A-Za-z]{2,24}$/.test(voice) ? voice : GNANI_TTS_VOICE;
+        const safeSpeed = typeof speed === 'number' && speed >= 0.5 && speed <= 2 ? speed : 1.0;
         const payload = {
             text: text.trim(),
-            voice: voice || GNANI_TTS_VOICE,
+            voice: safeVoice,
             model: 'timbre-v2.5',
             language: lang,
-            speed: typeof speed === 'number' ? speed : 1.0,
+            speed: safeSpeed,
             audio_config: {
                 sample_rate: 48000,
                 num_channels: 1,
@@ -568,8 +611,22 @@ app.post('/api/voice/tts', async (req, res) => {
     }
 });
 
-app.listen(PORT, '0.0.0.0', () => {
+const serverInstance = app.listen(PORT, '0.0.0.0', () => {
     console.log(`Déjà Gateway v2 running on port ${PORT} (0.0.0.0)`);
+});
+
+// Keep-alive timer to ensure Node event loop remains active across Windows background processes
+const keepAliveTimer = setInterval(() => {}, 1000 * 60 * 60);
+
+process.on('SIGINT', () => {
+    clearInterval(keepAliveTimer);
+    serverInstance.close();
+    process.exit(0);
+});
+process.on('SIGTERM', () => {
+    clearInterval(keepAliveTimer);
+    serverInstance.close();
+    process.exit(0);
 });
 
 process.on('unhandledRejection', (reason, promise) => { console.error('Unhandled Rejection:', reason); });

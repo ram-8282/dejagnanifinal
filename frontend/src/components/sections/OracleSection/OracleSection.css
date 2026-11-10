@@ -392,6 +392,19 @@
   min-width: 0;
 }
 
+.oracle-input-bar__lang {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+}
+
+/* On narrow screens hide the GNANI badge/globe so the text field keeps room */
+@media (max-width: 480px) {
+  .oracle-input-bar__lang .voice-lang-picker__label {
+    display: none;
+  }
+}
+
 .oracle-input-bar__field::placeholder {
   color: var(--color-text-muted);
 }
